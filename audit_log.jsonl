@@ -1,0 +1,5 @@
+{"content_id": "a8250eb2-c388-47d4-b9d8-1b0fc2325118", "creator_id": "test-user-1", "timestamp": "2026-06-29T22:34:37.926198Z", "attribution": "likely_human", "confidence": 0.9, "llm_score": 0.95, "status": "classified"}
+{"content_id": "59c7984a-ea7d-4ff4-81f8-55e4acfa9648", "creator_id": "test-user-2", "timestamp": "2026-06-29T22:34:38.687559Z", "attribution": "likely_ai", "confidence": 1.0, "llm_score": 0.0, "status": "classified"}
+{"content_id": "072299e3-8a98-4d8f-91b5-1a280c1ea44c", "creator_id": "test-user-3", "timestamp": "2026-06-29T22:34:39.944320Z", "attribution": "likely_human", "confidence": 1.0, "llm_score": 1.0, "status": "classified"}
+{"content_id": "9a85cdca-0f6d-4970-b2fb-6324fc24e1f3", "creator_id": "api-ai", "timestamp": "2026-06-29T23:53:38.368216Z", "attribution": "likely_ai", "confidence": 0.2403, "stylometric_score": 0.3008, "llm_score": 0.2, "status": "classified"}
+{"content_id": "2e9eb18b-60e3-4a89-a97a-8bf71d71a1d8", "creator_id": "api-human", "timestamp": "2026-06-29T23:53:39.204052Z", "attribution": "likely_human", "confidence": 0.672, "stylometric_score": 0.4799, "llm_score": 0.8, "status": "classified"}

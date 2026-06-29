@@ -55,19 +55,30 @@ If a creator disputes the verdict, they call **`POST /appeal/{id}`** with their 
 
 ## The Two Detection Signals
 
-The pipeline uses two deliberately **heterogeneous** signals so their blind spots only partially overlap. Signal 2 can catch a rhythm-varied AI text that fools Signal 1, and Signal 1 still works when Signal 2 is rate-limited or down.
+The pipeline uses two deliberately **heterogeneous** signals — one local/statistical, one semantic/API-backed — so their blind spots only partially overlap. Signal 2 (Groq) can catch a rhythm-varied AI text that fools Signal 1, and Signal 1 (stylometric) still works when Signal 2 is rate-limited or down. (Build order: Groq was implemented first in M3, the stylometric signal second in M4; the numbering here is taxonomy, not build order.)
 
-### Signal 1 — Sentence-Length Burstiness (statistical, local, no API cost)
+### Signal 1 — Stylometric (statistical, local, no API cost) — 3 metrics
 
-- **What property it measures:** the burstiness coefficient `B = (σ − μ) / (σ + μ)` of per-sentence word counts, normalized to `[0,1]` (where 1 = human-like). σ is the standard deviation and μ the mean of sentence lengths.
-- **Why that property differs between human and AI writing:** RLHF training rewarded smooth, readable prose, so LLMs converge on a narrow "comfortable" sentence-length range and rarely jolt between very short and very long sentences. Humans vary pace deliberately for rhetorical effect — short punches set against long, subordinate-clause-laden constructions — producing high burstiness.
-- **What it can't capture (blind spot):** genre dominates the signal. AP-style journalism, legal, and scientific writing are institutionally uniform and score AI-like even when human. Minimalists (Hemingway, Carver) also score AI-like. It is unreliable below ~6 sentences. And it is purely formal with zero semantic awareness, so an AI prompted to "vary your sentence rhythm" defeats it entirely.
+Implemented as `stylometric_signal()` in `signals.py`. Combines three locally-computed metrics into one human-likelihood score in `[0,1]`.
+
+- **What property it measures:** three stylometric metrics, each mapped to a human-likelihood and combined `0.50 / 0.25 / 0.25`:
+  1. **Sentence-length burstiness** `B = (σ − μ) / (σ + μ)` of per-sentence word counts, normalized `(B+1)/2`. (Primary metric, highest weight.)
+  2. **Type-token ratio (TTR)** = unique / total alphabetic tokens — lexical diversity; mapped via a ramp `clamp((TTR − 0.45)/0.40, 0, 1)`.
+  3. **Punctuation diversity** = count of distinct *expressive* marks (`; : — – ( ) ? ! " '` `…`), mapped `min(distinct/4, 1)`.
+- **Why those properties differ between human and AI writing:** RLHF rewarded smooth, readable prose, so LLMs converge on a narrow "comfortable" sentence-length range (low burstiness), reuse stock vocabulary at low temperature (lower TTR), and lean on commas/periods (low punctuation variety). Humans vary pace for rhetorical effect, reach for surprising words, and punctuate idiosyncratically (—, ;, parentheses).
+- **What it can't capture (blind spots):** genre dominates burstiness — AP journalism, legal, and scientific writing are institutionally uniform and read AI-like; minimalists (Hemingway) too. **TTR is length-confounded:** short texts inflate toward "human", long texts deflate, regardless of authorship. Punctuation diversity needs enough text and is defeated by plain human style or punctuation-rich formal AI. It is unreliable below ~3 sentences, and is purely formal with zero semantic awareness, so an AI prompted to "vary your rhythm and vocabulary" defeats it. **Calibration note (from M4 testing):** because sentence-length CV (σ/μ) is almost always < 1 for natural prose, raw `B` is usually negative and normalized burstiness sits in `[0, 0.5]` — so this signal rarely emits a confidently-human score on its own. That is a key reason the semantic Groq signal carries the larger combiner weight.
 
 ### Signal 2 — Groq LLM: Hedging Density + Specificity Ratio (semantic, API-backed)
 
 - **What property it measures:** two sub-scores from a structured Groq prompt — (1) **hedging density**, the frequency of epistemic hedges and generic transitions ("it is worth noting", "furthermore", "in many ways"); and (2) **specificity ratio**, the proportion of concrete, personal, verifiable detail versus abstract generalization. These combine into a human-likeness score where low hedging + high specificity = human-like.
 - **Why that property differs between human and AI writing:** RLHF penalized overconfident wrong answers, so LLMs hedge by default. They also default to abstraction because genuine specificity requires lived experience — a model writes "the aroma of freshly brewed coffee," whereas a human writes "the radiator clicked exactly twice before the heat came on."
 - **What it can't capture (blind spot):** academic and professional writing requires hedging by convention, so those human authors get flagged AI-like. Web and blog prose mirrors LLM transition conventions because they share a training source. There is a **circularity risk** — an LLM judging LLM-ness may detect its own model family more reliably than others. Lyric poetry and aphorism are structurally low-specificity, so that human work is flagged AI-like. Short texts inflate the judge's hallucination rate.
+
+### Signal Outputs & Combination
+
+**Signal outputs.** Each signal emits a **float in `[0,1]`** = its estimate that the text is *human*-authored (1 = confidently human, 0 = confidently AI), **not a binary flag**. The stylometric signal additionally combines its own three sub-metrics (burstiness `0.50`, TTR `0.25`, punctuation `0.25`) into that single score, and the per-metric detail rides along for the audit log alongside the Groq signal's hedging/specificity.
+
+**Combination of the two signals.** Weighted average: `combined = (w1·s1 + w2·s2) / (w1 + w2)`, with `w1 = 0.4` (stylometric) and `w2 = 0.6` (Groq, trusted more because it is semantic). When the text has `< 3` sentences, `w1 = 0` — the stylometric signal is statistically meaningless on tiny inputs, so the verdict rests entirely on Signal 2 and is flagged low-reliability. Implemented in `combined_confidence()` in `signals.py` (wired into `/submit` at the integration milestone).
 
 ## Request Flow Diagram
 
@@ -122,6 +133,102 @@ score > 0.55   -> human
 
 | Method & path | Purpose | Returns |
 |---|---|---|
-| `POST /submit` | Classify a submitted text | `id`, `attribution`, `human_confidence`, `transparency_label` |
-| `POST /appeal/{id}` | Contest a classification; sets status `under_review` | `status`, acknowledgement message |
-| `GET /log` | Structured audit log (≥3 entries) | array of decision + appeal records |
+| `POST /submit` | Classify a submitted text (body: `text`, `creator_id`) | `content_id`, `attribution`, `confidence`, `label`, `signals` |
+| `POST /appeal/{content_id}` | Contest a classification; sets status `under_review` | `status`, acknowledgement message |
+| `GET /log` | Structured audit log (≥3 entries) | `{"entries": [...]}`, most-recent-first |
+
+`attribution` is one of `likely_ai` / `likely_human` / `uncertain`. As of the confidence-scoring milestone, `confidence` is the **real combined human-likelihood score** (weighted average of both signals via `combined_confidence()`), `label` is the human-readable category (`Likely AI-generated` / `Uncertain` / `Likely human-written` — the full transparency-label *text* with percentages comes in M5), and `signals` carries both individual scores `{stylometric, llm}`.
+
+**Audit-log entry schema** (one JSONL line per submission, written by `audit.py`):
+
+```json
+{
+  "content_id": "3f7a2b1e-...",
+  "creator_id": "test-user-1",
+  "timestamp": "2026-06-29T14:32:10.123456Z",
+  "attribution": "likely_ai",
+  "confidence": 0.24,
+  "stylometric_score": 0.30,
+  "llm_score": 0.20,
+  "status": "classified"
+}
+```
+
+`confidence` is the combined score; `stylometric_score` and `llm_score` are the two signals' individual human-likelihood scores (captured so a reviewer can see which signal drove the verdict); `status` becomes `under_review` when an appeal is filed (M5).
+
+## Uncertainty Representation
+
+**What a 0.6 means.** A combined score of 0.6 means the system's blended estimate is that the text is **60% likely human-authored** (≈40% AI). It is an *expressed confidence indicator*, deliberately **not** claimed as a statistically calibrated posterior — it is a weighted blend of two heuristic scores. We stay honest about this in the label wording (always "likely", never "certainly").
+
+**Mapping raw outputs → score.** Signal 1: burstiness `B ∈ [-1,1]` → `(B+1)/2`. Signal 2: `1 − mean(hedging, 1−specificity)`, already in `[0,1]`. Combine via the weighted average above.
+
+**Thresholds** (creator-protective, asymmetric — see Confidence Thresholds): `< 0.30 → ai`, `0.30–0.55 → uncertain`, `> 0.55 → human`. This is **not a binary flip at 0.5** — there are three outcome bands, and the displayed confidence % scales continuously inside each band, so a 0.51 and a 0.95 produce visibly different labels.
+
+**How we test the score is meaningful (M4 check).** Run a batch of clearly-AI and clearly-human reference texts; confirm the two populations *separate* (AI clusters low, human clusters high) with the uncertain band between them, rather than both piling near 0.5. Separation — not perfect calibration — is the bar.
+
+**Calibration findings (4-input test via `test_scoring.py`).** All three categories are reachable and the combined score varies meaningfully (range 0.20–0.71):
+
+| input | stylometric | llm (Groq) | combined | result |
+|---|---|---|---|---|
+| clearly AI (paradigm-shift) | 0.39 | 0.20 | 0.28 | `likely_ai` ✓ |
+| clearly human (casual ramen) | 0.56 | 0.80 | 0.71 | `likely_human` ✓ |
+| borderline formal human (monetary policy) | 0.50 (abstains) | 0.20 | 0.20 | `likely_ai` ✗ |
+| borderline edited AI (remote work) | 0.51 | 0.25 | 0.36 | `uncertain` ✓ |
+
+Three of four match intuition. The miss — a formal **human** academic paragraph scoring `likely_ai` — is the documented academic-writing false positive: it is only 2 sentences, so the stylometric signal abstains (weight → 0) and the verdict rests entirely on Groq, which reads scholarly hedging + abstraction as AI. **Decision:** keep the scoring as-is (do not special-case short-text weighting) and rely on the **appeals workflow** as the safety net for exactly this case, rather than overfit the combiner to one example. This is the same scenario the False-Positive Trace was designed around.
+
+## Transparency Labels — the Three Variants
+
+The variant is chosen by band; the confidence **percentage shown scales with the score**, so strength is visible within a variant (a 0.95 and a 0.56 both read "Likely Human-Written" but show 95% vs 56%).
+
+**High-confidence AI** (score < 0.30) — displays AI-confidence = `round((1 − score) · 100)`%:
+
+> ⚠️ **Likely AI-Generated.** Our automated analysis indicates this content was most likely produced with an AI tool. Confidence: **{ai_pct}%**. This is an automated assessment, not a certainty — if you wrote this yourself, you can contest it.
+
+**High-confidence human** (score > 0.55) — displays human-confidence = `round(score · 100)`%:
+
+> ✓ **Likely Human-Written.** Our automated analysis found the hallmarks of human authorship in this content. Confidence: **{human_pct}%**.
+
+**Uncertain** (0.30 ≤ score ≤ 0.55) — displays human-authorship = `round(score · 100)`%:
+
+> ❓ **Inconclusive.** Our system could not determine with confidence whether this content was written by a person or generated with AI assistance. Human-authorship score: **{human_pct}%**. Treat this result as provisional.
+
+## Appeals Workflow
+
+- **Who can appeal:** the original submitter/creator of the content (in this build, anyone holding the `content_id`; on a real platform, the authenticated owner).
+- **What they provide:** the `content_id` plus free-text **reasoning** for why the classification is wrong (optionally citing evidence such as draft history).
+- **What the system does on receipt:** looks up the original decision; sets its status `reviewed → under_review`; **appends** an appeal record (timestamp + reasoning) *alongside* — never overwriting — the original decision in the audit log; returns an acknowledgement. **No automated re-classification.**
+- **What a human reviewer sees in the queue:** all `under_review` items, each showing the submitted text (or excerpt), the original attribution + confidence %, the per-signal breakdown (burstiness `B`, hedging, specificity), the transparency label that was shown to readers, the creator's appeal reasoning, and the relevant timestamps — enough context to make a human judgment.
+
+## Anticipated Edge Cases
+
+Specific scenarios this system handles poorly (not generic "it might be wrong" risks):
+
+1. **Repetitive, simple-vocabulary verse** (a villanelle, nursery rhyme, or refrain-heavy poem): short uniform lines → low burstiness (Signal 1 reads AI), and imagistic/abstract phrasing → low specificity (Signal 2 reads AI). A genuine human poem can score AI on *both* signals at once. The asymmetric band keeps most such cases in "uncertain" rather than "ai," and appeals catch the remainder.
+2. **Non-native-English authors:** ESL writing often favors simpler, more uniform sentence structures and formulaic transitions taught in instruction — tripping both signals toward AI and risking *systematic bias* against an entire population of legitimate human writers. This is the most ethically serious failure mode and a core reason for creator-protective thresholds plus easy appeals.
+3. **Very short submissions** (a haiku, a one-line excerpt): below Signal 1's 3-sentence floor, so the verdict leans entirely on Signal 2, which itself hallucinates more on short text. The system flags these as low-reliability.
+4. **Adversarial AI** explicitly prompted to "vary sentence rhythm and include specific personal anecdotes": defeats both signals by construction — a known, documented limitation that heuristic signals cannot fully close.
+
+## AI Tool Plan
+
+How `planning.md` will be used to prompt AI coding tools across the three implementation milestones.
+
+> **Build order note:** the conceptual taxonomy is Signal 1 = burstiness, Signal 2 = Groq. By implementation order, the **Groq signal is built first** (M3) because it carries the higher weight and exercises the API path; the local burstiness signal and the combiner follow in M4. Build order ≠ renumbering — the taxonomy above is unchanged.
+
+### M3 — Submission endpoint stub + first signal built (Groq)
+
+- **Spec sections to provide to the AI tool:** "The Two Detection Signals" (the Groq signal) + "Signal Outputs & Combination" + the Request Flow Diagram + the `POST /submit` row of the endpoint table.
+- **What to ask it to generate:** a Flask app skeleton (`app.py`) with a `POST /submit` **stub** accepting `JSON {text, creator_id}` and returning a **hardcoded** response (to verify routing before logic), plus the `groq_linguistic_signal()` function in `signals.py`. (`signals.py` already encodes this — M3 hardens it: optional client + guarded JSON parse.)
+- **How to verify:** call `groq_linguistic_signal()` directly on a few inputs (hedge-heavy/abstract vs. specific/direct) via `test_signals.py` and confirm it returns a **score (float in [0,1], not a binary flag)** that is lower for AI-like text *before* wiring it into the endpoint; then `curl POST /submit` and confirm the hardcoded structured JSON response and the 400 validation path.
+
+### M4 — Second signal (stylometric) + confidence scoring
+
+- **Spec sections to provide:** "The Two Detection Signals" (stylometric) + "Uncertainty Representation" + "Confidence Thresholds" + the diagram.
+- **What to ask for:** `stylometric_signal()` (burstiness + TTR + punctuation, combined `0.50/0.25/0.25`) and `combined_confidence()` using the **asymmetric** thresholds (`0.30/0.55`), wired into `POST /submit` (replacing the M3 placeholder) with the audit log capturing both individual scores. **Done.**
+- **What was checked:** (1) the two signals on shared inputs — they **agree** on clearly-AI text and **diverge** on clearly-human/short text, confirming each signal's strengths (`test_signals.py`); (2) the combined score on 4 calibration inputs (`test_scoring.py`) — three categories reachable, meaningful 0.20–0.71 range, 3/4 match intuition, with the formal-human false positive accepted and routed to appeals (see Calibration findings). End-to-end: `/submit` returns real `confidence` + `signals`, and `GET /log` entries carry `stylometric_score` + `llm_score` + combined `confidence`.
+
+### M5 — Production layer (labels, appeals, rate limiting, audit log)
+
+- **Spec sections to provide:** "Transparency Labels — the Three Variants" + "Appeals Workflow" + the diagram + the rate-limiting and audit-log requirements (Features 6–7).
+- **What to ask for:** label-generation logic producing the three variants, the `POST /appeal/{id}` endpoint, `GET /log`, Flask-Limiter rate limiting, and structured audit logging.
+- **How to verify:** craft inputs landing in each band and confirm **all three label variants are reachable**; submit then appeal and confirm status flips to `under_review` with the appeal logged *alongside* the original; confirm `GET /log` shows ≥3 entries; confirm the rate limit returns HTTP 429 past the threshold.
