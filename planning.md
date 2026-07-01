@@ -133,11 +133,11 @@ score > 0.55   -> human
 
 | Method & path | Purpose | Returns |
 |---|---|---|
-| `POST /submit` | Classify a submitted text (body: `text`, `creator_id`) | `content_id`, `attribution`, `confidence`, `label`, `signals` |
-| `POST /appeal/{content_id}` | Contest a classification; sets status `under_review` | `status`, acknowledgement message |
+| `POST /submit` | Classify a submitted text (body: `text`, `creator_id`) | `content_id`, `attribution`, `confidence`, `transparency_label`, `signals` |
+| `POST /appeal` | Contest a classification (body: `content_id`, `creator_reasoning`); sets status `under_review` | `content_id`, `status`, acknowledgement message |
 | `GET /log` | Structured audit log (≥3 entries) | `{"entries": [...]}`, most-recent-first |
 
-`attribution` is one of `likely_ai` / `likely_human` / `uncertain`. As of the confidence-scoring milestone, `confidence` is the **real combined human-likelihood score** (weighted average of both signals via `combined_confidence()`), `label` is the human-readable category (`Likely AI-generated` / `Uncertain` / `Likely human-written` — the full transparency-label *text* with percentages comes in M5), and `signals` carries both individual scores `{stylometric, llm}`.
+`attribution` is one of `likely_ai` / `likely_human` / `uncertain`. `confidence` is the **real combined human-likelihood score** (weighted average of both signals via `combined_confidence()`), `transparency_label` is the reader-facing text produced by `transparency_label()` — one of the three variants below, chosen by band so it **changes with the score** — and `signals` carries both individual scores `{stylometric, llm}`.
 
 **Audit-log entry schema** (one JSONL line per submission, written by `audit.py`):
 
@@ -150,11 +150,12 @@ score > 0.55   -> human
   "confidence": 0.24,
   "stylometric_score": 0.30,
   "llm_score": 0.20,
+  "transparency_label": "⚠️ Likely AI-Generated. ...",
   "status": "classified"
 }
 ```
 
-`confidence` is the combined score; `stylometric_score` and `llm_score` are the two signals' individual human-likelihood scores (captured so a reviewer can see which signal drove the verdict); `status` becomes `under_review` when an appeal is filed (M5).
+`confidence` is the combined score; `stylometric_score` and `llm_score` are the two signals' individual human-likelihood scores (captured so a reviewer can see which signal drove the verdict); `transparency_label` records what the reader was shown. When an appeal is filed, the **same entry is updated in place**: `status` → `"under_review"` and two fields are added — `appeal_reasoning` (the creator's text) and `appeal_timestamp` — while every original decision field is preserved.
 
 ## Uncertainty Representation
 
@@ -196,8 +197,8 @@ The variant is chosen by band; the confidence **percentage shown scales with the
 ## Appeals Workflow
 
 - **Who can appeal:** the original submitter/creator of the content (in this build, anyone holding the `content_id`; on a real platform, the authenticated owner).
-- **What they provide:** the `content_id` plus free-text **reasoning** for why the classification is wrong (optionally citing evidence such as draft history).
-- **What the system does on receipt:** looks up the original decision; sets its status `reviewed → under_review`; **appends** an appeal record (timestamp + reasoning) *alongside* — never overwriting — the original decision in the audit log; returns an acknowledgement. **No automated re-classification.**
+- **What they provide:** the `content_id` plus free-text `creator_reasoning` for why the classification is wrong (optionally citing evidence such as draft history).
+- **What the system does on receipt:** looks up the content's audit entry by `content_id`; **updates it in place** — sets `status` `classified → under_review` and adds `appeal_reasoning` + `appeal_timestamp` — while **preserving every original decision field** (attribution, confidence, both signal scores, transparency label), so the original decision is never lost; returns an acknowledgement. **No automated re-classification.**
 - **What a human reviewer sees in the queue:** all `under_review` items, each showing the submitted text (or excerpt), the original attribution + confidence %, the per-signal breakdown (burstiness `B`, hedging, specificity), the transparency label that was shown to readers, the creator's appeal reasoning, and the relevant timestamps — enough context to make a human judgment.
 
 ## Anticipated Edge Cases
@@ -230,5 +231,6 @@ How `planning.md` will be used to prompt AI coding tools across the three implem
 ### M5 — Production layer (labels, appeals, rate limiting, audit log)
 
 - **Spec sections to provide:** "Transparency Labels — the Three Variants" + "Appeals Workflow" + the diagram + the rate-limiting and audit-log requirements (Features 6–7).
-- **What to ask for:** label-generation logic producing the three variants, the `POST /appeal/{id}` endpoint, `GET /log`, Flask-Limiter rate limiting, and structured audit logging.
-- **How to verify:** craft inputs landing in each band and confirm **all three label variants are reachable**; submit then appeal and confirm status flips to `under_review` with the appeal logged *alongside* the original; confirm `GET /log` shows ≥3 entries; confirm the rate limit returns HTTP 429 past the threshold.
+- **What to ask for:** label-generation logic producing the three variants, the `POST /appeal` endpoint, `GET /log`, Flask-Limiter rate limiting, and structured audit logging.
+- **Status: M5 complete.** `transparency_label()` (3 variants, `test_labels.py`), `POST /appeal` (in-place audit update → `under_review` + `appeal_reasoning`), `GET /log`, structured audit logging (both signal scores + label), and **Flask-Limiter rate limiting** (`10/min;100/day` on `/submit`, `memory://`, JSON 429 handler) are all done. Full README written.
+- **Verified:** all three label variants reachable via `/submit`; appeal flips status to `under_review` with reasoning on the original entry; `GET /log` shows ≥3 structured entries incl. an appeal; rate-limit test = 10×`200` then `429`; `/log` and `/appeal` remain unthrottled.

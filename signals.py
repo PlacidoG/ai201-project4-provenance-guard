@@ -214,3 +214,34 @@ def combined_confidence(stylo: dict, groq: dict) -> dict:
             "llm": groq["score"],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Transparency label: the reader-facing text. Chosen by the same bands as
+# combined_confidence() so the label can never disagree with the attribution.
+# The displayed percentage is verdict-dependent (AI-confidence for an AI
+# verdict, human-confidence otherwise) and scales with the score, so e.g. a
+# 0.95 and a 0.56 both read "Likely Human-Written" but show different numbers.
+# ---------------------------------------------------------------------------
+
+def transparency_label(confidence: float) -> str:
+    if confidence < 0.30:
+        ai_pct = round((1 - confidence) * 100)
+        return (
+            f"⚠️ Likely AI-Generated. Our automated analysis indicates this content "
+            f"was most likely produced with an AI tool. Confidence: {ai_pct}%. This is "
+            f"an automated assessment, not a certainty — if you wrote this yourself, "
+            f"you can contest it."
+        )
+    if confidence > 0.55:
+        human_pct = round(confidence * 100)
+        return (
+            f"✓ Likely Human-Written. Our automated analysis found the hallmarks of "
+            f"human authorship in this content. Confidence: {human_pct}%."
+        )
+    human_pct = round(confidence * 100)
+    return (
+        f"❓ Inconclusive. Our system could not determine with confidence whether this "
+        f"content was written by a person or generated with AI assistance. "
+        f"Human-authorship score: {human_pct}%. Treat this result as provisional."
+    )
